@@ -1,0 +1,10 @@
+flask
+python-dotenv
+chromadb
+sentence-transformers
+google-generativeai
+pypdf
+beautifulsoup4
+requests
+mail-parser
+markdown
