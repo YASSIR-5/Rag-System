@@ -105,7 +105,13 @@ def load_notes_context() -> str:
     return "\n".join(lines)
 
 
-def ask(question: str, filter_sources: list[str] = None, session_id: str = "main") -> dict:
+def get_model() -> str:
+    if os.path.exists("model_pref.txt"):
+        return open("model_pref.txt").read().strip()
+    return "llama-3.3-70b-versatile"
+
+
+def ask(question: str, filter_sources: list = None, session_id: str = "main", space_prompt: str = "") -> dict:
     chunks, metadatas = store.query(
         question=question,
         n_results=20,
@@ -125,13 +131,15 @@ def ask(question: str, filter_sources: list[str] = None, session_id: str = "main
     notes_context = load_notes_context()
     today = datetime.now().strftime("%A, %B %d, %Y — %H:%M")
 
+    space_section = f"\nSPACE PERSONALITY & INSTRUCTIONS:\n{space_prompt}\n" if space_prompt else ""
+
     system_prompt = f"""You are Yassir's personal AI second brain. You know everything about him.
 
 CURRENT DATE & TIME: {today}
 
 WHO YOU ARE TALKING TO:
 {profile_context}
-
+{space_section}
 {notes_context}
 
 RULES:
@@ -159,9 +167,7 @@ CONTEXT FROM KNOWLEDGE BASE:
 
     try:
         response = client.chat.completions.create(
-
-            #model="llama-3.3-70b-versatile",
-            model="llama-3.1-8b-instant",
+            model=get_model(),
             messages=messages,
             max_tokens=2048,
         )

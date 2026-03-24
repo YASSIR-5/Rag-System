@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 from ingest import ingest_file, ingest_url
-from query import ask, list_sessions, delete_session, load_memory
+from query import ask, list_sessions, delete_session, load_memory, save_memory
 from vector_store import VectorStore
 from chunker import chunk_text
 from loaders.web_crawler import crawl_site
@@ -44,12 +44,50 @@ def save_profile(profile):
 def load_spaces():
     if os.path.exists(SPACES_FILE):
         with open(SPACES_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            spaces = json.load(f)
+        # Migration: add threads/prompt fields if missing
+        changed = False
+        for s in spaces:
+            if "threads" not in s:
+                s["threads"] = []
+                changed = True
+            if "prompt" not in s:
+                s["prompt"] = ""
+                changed = True
+            # Migrate existing space session to a General thread
+            old_session = f"space-{s['id']}"
+            memory = load_memory()
+            if old_session in memory["sessions"] and len(memory["sessions"][old_session]) > 0:
+                already_migrated = any(t.get("migrated") for t in s["threads"])
+                if not already_migrated:
+                    thread_id = str(uuid.uuid4())
+                    thread_session = f"thread-{thread_id}"
+                    memory["sessions"][thread_session] = memory["sessions"][old_session]
+                    save_memory(memory)
+                    s["threads"].append({
+                        "id": thread_id,
+                        "name": "General",
+                        "summary": "Migrated from previous space chat.",
+                        "created": datetime.now().isoformat(),
+                        "last_active": datetime.now().isoformat(),
+                        "message_count": len(memory["sessions"][thread_session]),
+                        "migrated": True
+                    })
+                    changed = True
+        if changed:
+            save_spaces(spaces)
+        return spaces
     return []
 
 def save_spaces(spaces):
     with open(SPACES_FILE, "w", encoding="utf-8") as f:
         json.dump(spaces, f, indent=2, ensure_ascii=False)
+
+def get_space(space_id):
+    for s in load_spaces():
+        if s["id"] == space_id:
+            return s
+    return None
 
 
 # ── Routes ─────────────────────────────────────────────────
@@ -104,10 +142,11 @@ def query_route():
     question = data.get("question", "").strip()
     sources = data.get("sources") or None
     session_id = data.get("session_id", "main")
+    space_prompt = data.get("space_prompt", "")
     if not question:
         return jsonify({"error": "No question provided"}), 400
     try:
-        result = ask(question, filter_sources=sources, session_id=session_id)
+        result = ask(question, filter_sources=sources, session_id=session_id, space_prompt=space_prompt)
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e), "answer": f"Error: {str(e)}", "sources": [], "chunks_used": []}), 500
@@ -188,6 +227,8 @@ def set_profile():
     return jsonify({"message": "Profile saved."})
 
 
+# ── Spaces ─────────────────────────────────────────────────
+
 @app.route("/spaces", methods=["GET"])
 def get_spaces():
     return jsonify({"spaces": load_spaces()})
@@ -203,7 +244,9 @@ def create_space():
         "icon": data.get("icon", "◈"),
         "color": data.get("color", "#929876"),
         "description": data.get("description", ""),
+        "prompt": data.get("prompt", ""),
         "pinned": data.get("pinned", True),
+        "threads": [],
         "created": datetime.now().isoformat()
     }
     spaces.append(space)
@@ -217,17 +260,130 @@ def update_space(space_id):
     data = request.json
     for s in spaces:
         if s["id"] == space_id:
-            s.update({k: v for k, v in data.items() if k != "id"})
+            s.update({k: v for k, v in data.items() if k not in ["id", "threads"]})
             break
     save_spaces(spaces)
     return jsonify({"message": "Space updated."})
 
 
 @app.route("/spaces/<space_id>", methods=["DELETE"])
-def delete_space(space_id):
+def delete_space_route(space_id):
     spaces = [s for s in load_spaces() if s["id"] != space_id]
     save_spaces(spaces)
     return jsonify({"message": "Space deleted."})
+
+
+# ── Threads ─────────────────────────────────────────────────
+
+@app.route("/spaces/<space_id>/threads", methods=["GET"])
+def get_threads(space_id):
+    space = get_space(space_id)
+    if not space:
+        return jsonify({"error": "Space not found"}), 404
+    return jsonify({"threads": space.get("threads", [])})
+
+
+@app.route("/spaces/<space_id>/threads", methods=["POST"])
+def create_thread(space_id):
+    spaces = load_spaces()
+    data = request.json
+    thread = {
+        "id": str(uuid.uuid4()),
+        "name": data.get("name", "New Thread"),
+        "summary": "",
+        "created": datetime.now().isoformat(),
+        "last_active": datetime.now().isoformat(),
+        "message_count": 0
+    }
+    for s in spaces:
+        if s["id"] == space_id:
+            if "threads" not in s:
+                s["threads"] = []
+            s["threads"].append(thread)
+            break
+    save_spaces(spaces)
+    return jsonify({"message": "Thread created.", "thread": thread})
+
+
+@app.route("/spaces/<space_id>/threads/<thread_id>", methods=["DELETE"])
+def delete_thread(space_id, thread_id):
+    spaces = load_spaces()
+    for s in spaces:
+        if s["id"] == space_id:
+            s["threads"] = [t for t in s.get("threads", []) if t["id"] != thread_id]
+            break
+    save_spaces(spaces)
+    # Also delete thread session from memory
+    delete_session(f"thread-{thread_id}")
+    return jsonify({"message": "Thread deleted."})
+
+
+@app.route("/spaces/<space_id>/threads/<thread_id>/summary", methods=["POST"])
+def update_thread_summary(space_id, thread_id):
+    """Generate and save a summary for a thread."""
+    spaces = load_spaces()
+    space = next((s for s in spaces if s["id"] == space_id), None)
+    if not space:
+        return jsonify({"error": "Space not found"}), 404
+
+    thread = next((t for t in space.get("threads", []) if t["id"] == thread_id), None)
+    if not thread:
+        return jsonify({"error": "Thread not found"}), 404
+
+    # Get thread messages
+    memory = load_memory()
+    session_id = f"thread-{thread_id}"
+    messages = memory["sessions"].get(session_id, [])
+    if not messages:
+        return jsonify({"summary": ""})
+
+    # Build conversation text for summarization
+    convo = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages[-20:]])
+    summary_question = f"Summarize this conversation in 1-2 sentences, focus on key facts and decisions:\n\n{convo}"
+
+    try:
+        result = ask(summary_question, session_id="summary-temp")
+        summary = result["answer"][:200]  # keep it short
+    except Exception as e:
+        summary = "Summary unavailable."
+
+    # Save summary and update thread metadata
+    for s in spaces:
+        if s["id"] == space_id:
+            for t in s.get("threads", []):
+                if t["id"] == thread_id:
+                    t["summary"] = summary
+                    t["message_count"] = len(messages)
+                    t["last_active"] = messages[-1].get("timestamp", datetime.now().isoformat())
+                    break
+            break
+    save_spaces(spaces)
+
+    return jsonify({"summary": summary})
+
+
+@app.route("/spaces/<space_id>/threads/<thread_id>/activity", methods=["POST"])
+def update_thread_activity(space_id, thread_id):
+    """Update thread message count and last active time."""
+    spaces = load_spaces()
+    data = request.json
+    for s in spaces:
+        if s["id"] == space_id:
+            for t in s.get("threads", []):
+                if t["id"] == thread_id:
+                    t["message_count"] = data.get("message_count", t.get("message_count", 0))
+                    t["last_active"] = datetime.now().isoformat()
+                    break
+            break
+    save_spaces(spaces)
+    return jsonify({"message": "Updated."})
+
+
+@app.route("/model", methods=["POST"])
+def set_model():
+    model = request.json.get("model", "llama-3.3-70b-versatile")
+    open("model_pref.txt", "w").write(model)
+    return jsonify({"message": "Model updated."})
 
 
 if __name__ == "__main__":
