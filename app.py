@@ -10,6 +10,7 @@ from chunker import chunk_text
 from loaders.web_crawler import crawl_site
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
 UPLOAD_FOLDER = "uploads"
 NOTES_FILE = "notes.json"
 PROFILE_FILE = "profile.json"
@@ -109,6 +110,24 @@ def ingest_file_route():
         return jsonify({"message": f"'{file.filename}' ingested — {count} chunks added."})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
+@app.route("/ingest/folder", methods=["POST"])
+def ingest_folder_route():
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify({"error": "No files provided"}), 400
+    total_chunks = 0
+    results = []
+    for file in files:
+        path = os.path.join(UPLOAD_FOLDER, file.filename.replace("/", "_").replace("\\", "_"))
+        file.save(path)
+        try:
+            count = ingest_file(path)
+            total_chunks += count
+            results.append({"file": file.filename, "chunks": count})
+        except Exception as e:
+            results.append({"file": file.filename, "error": str(e)})
+    return jsonify({"message": f"{len(files)} files processed — {total_chunks} total chunks added.", "results": results})
 
 
 @app.route("/ingest/url", methods=["POST"])
@@ -245,6 +264,7 @@ def create_space():
         "color": data.get("color", "#929876"),
         "description": data.get("description", ""),
         "prompt": data.get("prompt", ""),
+        "default_sources": data.get("default_sources", []),
         "pinned": data.get("pinned", True),
         "threads": [],
         "created": datetime.now().isoformat()
@@ -252,6 +272,7 @@ def create_space():
     spaces.append(space)
     save_spaces(spaces)
     return jsonify({"message": "Space created.", "space": space})
+
 
 
 @app.route("/spaces/<space_id>", methods=["PUT"])
@@ -264,6 +285,7 @@ def update_space(space_id):
             break
     save_spaces(spaces)
     return jsonify({"message": "Space updated."})
+
 
 
 @app.route("/spaces/<space_id>", methods=["DELETE"])
